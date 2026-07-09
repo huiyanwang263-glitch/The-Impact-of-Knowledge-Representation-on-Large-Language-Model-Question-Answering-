@@ -1,11 +1,15 @@
-# KQA Pro Knowledge Representation Experiments
+# Knowledge Representation Experiments for KQA Pro and 2WikiMultihopQA
 
 This repository contains data-processing and evaluation pipelines for comparing
-knowledge representations and retrieval settings on KQA Pro. The experiment
-code is maintained in `processing/`; the KQA Pro dataset itself is not
-redistributed by this repository.
+knowledge representations and retrieval settings. The main controlled KB
+experiments use KQA Pro; supplementary document-grounded experiments use
+2WikiMultihopQA.
+
+The dataset files themselves are not redistributed by this repository.
 
 ## Processing pipelines
+
+### KQA Pro
 
 - `closed_book_processing`: closed-book baseline experiments.
 - `knowledge_representation_processing`: canonical statement generation and
@@ -14,6 +18,13 @@ redistributed by this repository.
 - `rag_full_kb_processing`: full-KB and atomic-KB corpus construction and RAG.
 - `e2_forced_gold_processing`: forced-gold evidence experiments using retrieval
   results from the RAG pipeline.
+
+### 2WikiMultihopQA
+
+- `twowiki_closed_book_processing`: D0 closed-book baseline on fixed
+  compositional/inference questions.
+- `twowiki_gold_only_processing`: D1 gold-only representation experiment using
+  2Wiki evidence triples and supporting sentences.
 
 Each directory contains its own README with commands and experiment-specific
 details.
@@ -73,3 +84,8 @@ excluded from Git and can be reproduced by following the corresponding README.
 
 See [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md) for the experimental rationale,
 conditions, controls, and evaluation plan.
+
+2Wiki experiments are designed as a document-grounded supplement to the KQA Pro
+controlled KB setting. For representation-controlled comparisons, use 2Wiki
+`evidences` as the canonical fact layer and render aligned document-style,
+triple, and graph variants from the same facts.
