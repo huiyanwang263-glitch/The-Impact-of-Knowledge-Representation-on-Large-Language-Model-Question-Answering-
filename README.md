@@ -15,6 +15,8 @@ The dataset files themselves are not redistributed by this repository.
 - `knowledge_representation_processing`: canonical statement generation and
   oracle-context experiments.
 - `noisy_oracle_processing`: controlled gold-plus-noise experiments.
+- `e3_manual_llm_retrieval_processing`: bounded manual candidate banks with
+  representation-specific LLM evidence selection for the fixed 15 questions.
 - `rag_full_kb_processing`: full-KB and atomic-KB corpus construction and RAG.
 - `e2_forced_gold_processing`: forced-gold evidence experiments using retrieval
   results from the RAG pipeline.
