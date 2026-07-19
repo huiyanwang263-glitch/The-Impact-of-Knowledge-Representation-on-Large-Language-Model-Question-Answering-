@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E2: force complete Gold evidence into native E3 retrieval noise for 15 questions."""
+"""KQA Pro E2: repair saved E3-M selections with complete Gold evidence."""
 
 from __future__ import annotations
 
@@ -8,254 +8,329 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 HERE = Path(__file__).resolve().parent
-DATASET = HERE.parent
-ORACLE_DIR = DATASET / "knowledge_representation_processing"
-RAG_DIR = DATASET / "rag_full_kb_processing"
-sys.path.insert(0, str(ORACLE_DIR))
-
-import run_oracle_20 as oracle  # noqa: E402
-from build_pilot_representations import format_value, statement_to_sentence  # noqa: E402
-
-
-REPS = ("document", "triple", "graph")
+PROCESSING = HERE.parent
+ORACLE_DIR = PROCESSING / "knowledge_representation_processing"
+E3_DIR = PROCESSING / "e3_manual_llm_retrieval_processing"
+DEFAULT_E3_OUTPUT = E3_DIR / "output" / "e3_manual_hops_15"
+sys.path.insert(0, str(E3_DIR))
+import run_e3_manual_llm_retrieval_hops_15 as e3  # noqa: E402
 
 
-def read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                yield json.loads(line)
+REPS = e3.REPS
+PROMPT_VERSION = "e3_manual_answer_prompt_v1"
 
 
-def qualifier_text(qualifiers: list[dict[str, Any]]) -> str:
-    if not qualifiers:
-        return ""
-    rendered = "; ".join(
-        f"{item['key']}={format_value(item['value'])}" for item in qualifiers
-    )
-    return f" [qualifiers: {rendered}]"
-
-
-def triple_line(statement: dict[str, Any]) -> str:
-    return (
-        f"({statement['subject']['label']} | {statement['predicate']} | "
-        f"{statement['object']['label']}){qualifier_text(statement['qualifiers'])}"
-    )
-
-
-def render_context(statements: list[dict[str, Any]], rep: str) -> str:
-    """Render one ordered statement sequence without changing its factual content."""
-    if rep == "document":
-        return " ".join(statement_to_sentence(item) for item in statements)
-    if rep == "triple":
-        return "\n".join(triple_line(item) for item in statements)
-
-    edges = ["Directed labelled graph (one edge per line):"]
-    for statement in statements:
-        source_id = statement["subject"]["id"]
-        source_label = statement["subject"]["label"]
-        if statement["object"]["kind"] == "literal":
-            target_id = f"literal_{statement['statement_id']}"
-        else:
-            target_id = statement["object"]["id"]
-        target_label = statement["object"]["label"]
-        edges.append(
-            f"EDGE {source_id} ({source_label}) --[{statement['predicate']}]--> "
-            f"{target_id} ({target_label})"
-            + qualifier_text(statement["qualifiers"])
-        )
-    return "\n".join(edges)
-
-
-def unique_retrieved_ids(row: dict[str, Any]) -> tuple[list[str], dict[str, int]]:
-    """Flatten selected chunks in retrieval order and retain first-seen rank."""
-    ids: list[str] = []
-    first_rank: dict[str, int] = {}
-    for chunk in sorted(row["selected_chunks"], key=lambda item: item["rank"]):
-        for statement_id in chunk["statement_ids"]:
-            if statement_id not in first_rank:
-                first_rank[statement_id] = chunk["rank"]
-                ids.append(statement_id)
-    return ids, first_rank
-
-
-def force_gold(row: dict[str, Any]) -> dict[str, Any]:
-    """Replace lowest-ranked non-Gold statements one-for-one with missing Gold."""
-    original_ids, first_rank = unique_retrieved_ids(row)
-    gold_ids = list(row["gold_statement_ids"])
-    gold_set = set(gold_ids)
-    original_set = set(original_ids)
-    missing = [statement_id for statement_id in gold_ids if statement_id not in original_set]
-
-    removable = sorted(
-        (statement_id for statement_id in original_ids if statement_id not in gold_set),
-        key=lambda statement_id: (first_rank[statement_id], original_ids.index(statement_id)),
-        reverse=True,
-    )
-    if len(removable) < len(missing):
-        raise RuntimeError(f"Not enough noise statements to replace for {row['question_id']}")
-
-    final_ids = list(original_ids)
-    removed = removable[: len(missing)]
-    replacements = []
-    for missing_id, removed_id in zip(missing, removed):
-        position = final_ids.index(removed_id)
-        final_ids[position] = missing_id
-        replacements.append(
-            {
-                "position": position,
-                "removed_noise_statement_id": removed_id,
-                "removed_noise_first_chunk_rank": first_rank[removed_id],
-                "inserted_gold_statement_id": missing_id,
-            }
-        )
-
-    if len(final_ids) != len(original_ids) or not gold_set <= set(final_ids):
-        raise AssertionError(f"E2 construction invariant failed: {row['question_id']}")
-    return {
-        "original_statement_ids": original_ids,
-        "original_statement_count": len(original_ids),
-        "original_covered_gold_statement_ids": [sid for sid in gold_ids if sid in original_set],
-        "original_missing_gold_statement_ids": missing,
-        "removed_noise_statement_ids": removed,
-        "replacements": replacements,
-        "final_statement_ids": final_ids,
-        "final_statement_count": len(final_ids),
-        "final_complete_gold": True,
-    }
-
-
-def load_needed_statements(path: Path, needed_ids: set[str]) -> dict[str, dict[str, Any]]:
-    statements: dict[str, dict[str, Any]] = {}
-    for statement in read_jsonl(path):
-        statement_id = statement["statement_id"]
-        if statement_id in needed_ids:
-            statements[statement_id] = statement
-            if len(statements) == len(needed_ids):
-                break
-    missing = needed_ids - statements.keys()
-    if missing:
-        raise RuntimeError(f"Canonical statements missing {len(missing)} IDs")
-    return statements
-
-
-def build_bundle(args: argparse.Namespace) -> list[dict[str, Any]]:
-    questions = {row["question_id"]: row for row in read_jsonl(args.questions)}
-    retrieval_rows = [
-        row
-        for row in read_jsonl(args.retrieval_results)
-        if row["representation"] in args.representations
-    ]
-    expected = {(qid, rep) for qid in questions for rep in args.representations}
-    actual = {(row["question_id"], row["representation"]) for row in retrieval_rows}
-    if actual != expected or len(retrieval_rows) != len(expected):
-        raise RuntimeError(
-            f"Expected exactly {len(expected)} question/representation rows; got "
-            f"{len(retrieval_rows)} rows and {len(actual)} unique keys"
-        )
-
-    constructions = []
-    needed_ids: set[str] = set()
-    for row in retrieval_rows:
-        built = force_gold(row)
-        constructions.append((row, built))
-        needed_ids.update(built["original_statement_ids"])
-        needed_ids.update(built["final_statement_ids"])
-    statements = load_needed_statements(args.canonical_statements, needed_ids)
-
-    bundle = []
-    for row, built in constructions:
-        question = questions[row["question_id"]]
-        ordered = [statements[statement_id] for statement_id in built["final_statement_ids"]]
-        context = render_context(ordered, row["representation"])
-        source_ordered = [
-            statements[statement_id] for statement_id in built["original_statement_ids"]
-        ]
-        source_replay_context = render_context(source_ordered, row["representation"])
-        bundle.append(
-            {
-                "question_id": row["question_id"],
-                "train_index": question["train_index"],
-                "hop_count": row["hop_count"],
-                "representation": row["representation"],
-                "question": row["question"],
-                "choices": question["choices"],
-                "answer": question["answer"],
-                "gold_statement_ids": row["gold_statement_ids"],
-                "source_retrieval_metrics": row["retrieval_metrics"],
-                **built,
-                "source_replay_context": source_replay_context,
-                "source_replay_context_word_count": len(source_replay_context.split()),
-                "context": context,
-                "context_word_count": len(context.split()),
-            }
-        )
-    return bundle
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def average(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
-def summarize(rows: list[dict[str, Any]], model_ran: bool) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "rows": len(rows),
-        "source_complete_path_recall": average(
-            [float(row["source_retrieval_metrics"]["complete_path_recall"]) for row in rows]
-        ),
-        "final_complete_path_recall": average(
-            [float(row["final_complete_gold"]) for row in rows]
-        ),
-        "mean_original_statements": average(
-            [float(row["original_statement_count"]) for row in rows]
-        ),
-        "mean_final_statements": average([float(row["final_statement_count"]) for row in rows]),
-        "mean_replacements": average([float(len(row["replacements"])) for row in rows]),
-        "mean_context_words": average([float(row["context_word_count"]) for row in rows]),
+def select_questions(
+    questions: list[dict[str, Any]], max_per_hop: int | None
+) -> list[dict[str, Any]]:
+    if max_per_hop is None:
+        return list(questions)
+    selected: list[dict[str, Any]] = []
+    counts: Counter[int] = Counter()
+    for question in questions:
+        hop = int(question["hop_count"])
+        if counts[hop] >= max_per_hop:
+            continue
+        selected.append(question)
+        counts[hop] += 1
+    return selected
+
+
+def force_complete_gold(
+    selected_ids: list[str], gold_ids: list[str]
+) -> tuple[list[str], dict[str, Any]]:
+    """Replace tail noise with missing Gold, expanding only when unavoidable."""
+    if len(selected_ids) != len(set(selected_ids)):
+        raise RuntimeError("E3 selection contains duplicate statement IDs")
+    if len(gold_ids) != len(set(gold_ids)):
+        raise RuntimeError("Gold statement IDs are not unique")
+
+    gold_set = set(gold_ids)
+    selected_set = set(selected_ids)
+    missing_gold = [statement_id for statement_id in gold_ids if statement_id not in selected_set]
+    final_ids = list(selected_ids)
+    removable_positions = [
+        index
+        for index in range(len(final_ids) - 1, -1, -1)
+        if final_ids[index] not in gold_set
+    ]
+    replacements: list[dict[str, Any]] = []
+    appended_gold: list[str] = []
+    removed_noise: list[str] = []
+    for statement_id in missing_gold:
+        if removable_positions:
+            position = removable_positions.pop(0)
+            removed_id = final_ids[position]
+            final_ids[position] = statement_id
+            removed_noise.append(removed_id)
+            replacements.append(
+                {
+                    "position": position,
+                    "removed_noise_statement_id": removed_id,
+                    "inserted_gold_statement_id": statement_id,
+                }
+            )
+        else:
+            final_ids.append(statement_id)
+            appended_gold.append(statement_id)
+
+    if not gold_set <= set(final_ids):
+        raise RuntimeError("Forced-Gold completion failed")
+    if len(final_ids) != max(len(selected_ids), len(gold_ids)):
+        raise RuntimeError("Forced-Gold context-size invariant failed")
+
+    retained_noise = [statement_id for statement_id in final_ids if statement_id not in gold_set]
+    return final_ids, {
+        "raw_selected_statement_count": len(selected_ids),
+        "forced_context_statement_count": len(final_ids),
+        "missing_gold_statement_ids": missing_gold,
+        "gold_added_statement_count": len(missing_gold),
+        "replacements": replacements,
+        "removed_noise_statement_ids": removed_noise,
+        "removed_noise_statement_count": len(removed_noise),
+        "appended_gold_statement_ids": appended_gold,
+        "appended_gold_statement_count": len(appended_gold),
+        "retained_noise_statement_ids": retained_noise,
+        "retained_noise_statement_count": len(retained_noise),
+        "context_size_preserved": len(final_ids) == len(selected_ids),
+        "context_expanded": len(final_ids) > len(selected_ids),
     }
-    if model_ran:
+
+
+def selection_hash(rows: list[dict[str, Any]]) -> str:
+    return e3.stable_digest(
+        [
+            {
+                "question_id": str(row["question_id"]),
+                "representation": row["representation"],
+                "selected_statement_ids": row.get("selected_statement_ids", []),
+                "selector_valid": bool(row.get("selector_valid")),
+            }
+            for row in sorted(
+                rows,
+                key=lambda item: (
+                    str(item["question_id"]),
+                    REPS.index(item["representation"]),
+                ),
+            )
+        ]
+    )
+
+
+def build_bundle(
+    questions: list[dict[str, Any]],
+    candidate_banks: list[dict[str, Any]],
+    selection_rows: list[dict[str, Any]],
+    representations: list[str],
+    top_k: int,
+) -> list[dict[str, Any]]:
+    question_by_id = {str(row["question_id"]): row for row in questions}
+    candidate_by_id = {str(row["question_id"]): row for row in candidate_banks}
+    selection_by_key = {
+        (str(row["question_id"]), row["representation"]): row
+        for row in selection_rows
+        if row["representation"] in representations
+    }
+    if len(question_by_id) != len(questions):
+        raise RuntimeError("Question IDs are not unique")
+    expected = {
+        (question_id, representation)
+        for question_id in question_by_id
+        for representation in representations
+    }
+    if set(selection_by_key) != expected:
+        missing = sorted(expected - set(selection_by_key))
+        extra = sorted(set(selection_by_key) - expected)
+        raise RuntimeError(f"E3 selection case mismatch; missing={missing[:5]}, extra={extra[:5]}")
+
+    result: list[dict[str, Any]] = []
+    for question in questions:
+        question_id = str(question["question_id"])
+        if question_id not in candidate_by_id:
+            raise RuntimeError(f"E3 candidate bank missing question {question_id}")
+        bank = candidate_by_id[question_id]
+        if list(question["gold_statement_ids"]) != list(bank["gold_statement_ids"]):
+            raise RuntimeError(f"Question/candidate Gold mismatch for {question_id}")
+        statement_by_id = {
+            statement["statement_id"]: statement
+            for statement in bank["candidate_statements"]
+        }
+        if set(statement_by_id) != set(bank["candidate_statement_ids"]):
+            raise RuntimeError(f"Candidate statement mismatch for {question_id}")
+
+        for representation in representations:
+            source = selection_by_key[(question_id, representation)]
+            if list(source.get("candidate_statement_ids", [])) != list(
+                bank["candidate_statement_ids"]
+            ):
+                raise RuntimeError(
+                    f"E3 selection/candidate order mismatch for {question_id}/{representation}"
+                )
+            raw_selected = list(source.get("selected_statement_ids", []))
+            if len(raw_selected) > top_k:
+                raise RuntimeError(f"E3 selection exceeds Top-K for {question_id}/{representation}")
+            unknown = [statement_id for statement_id in raw_selected if statement_id not in statement_by_id]
+            if unknown:
+                raise RuntimeError(
+                    f"E3 selection has unknown IDs for {question_id}/{representation}: {unknown[:5]}"
+                )
+            final_ids, forcing = force_complete_gold(
+                raw_selected, list(bank["gold_statement_ids"])
+            )
+            forcing["invalid_selector_fallback_used"] = not bool(
+                source.get("selector_valid")
+            )
+            if len(final_ids) > top_k:
+                raise RuntimeError(f"Forced E2 context exceeds Top-K for {question_id}/{representation}")
+            final_statements = [statement_by_id[statement_id] for statement_id in final_ids]
+            context = e3.render_statements(final_statements, representation)
+            result.append(
+                {
+                    "question_id": question_id,
+                    "train_index": question["train_index"],
+                    "hop_count": int(question["hop_count"]),
+                    "representation": representation,
+                    "question": question["question"],
+                    "choices": question["choices"],
+                    "answer": question["answer"],
+                    "gold_statement_ids": list(bank["gold_statement_ids"]),
+                    "candidate_statement_ids": list(bank["candidate_statement_ids"]),
+                    "raw_selected_statement_ids": raw_selected,
+                    "selected_statement_ids": final_ids,
+                    "selected_statements": final_statements,
+                    "selected_context": context,
+                    "forcing": forcing,
+                    "selector_source": "saved_e3_manual_selection",
+                    "selector_valid": bool(source.get("selector_valid")),
+                    "selector_attempts": source.get("selector_attempts"),
+                    "selector_unknown_ids": source.get("selector_unknown_ids", []),
+                    "selector_usage": source.get("selector_usage", {}),
+                    "selector_latency_seconds": source.get("selector_latency_seconds", 0.0),
+                    "retrieval_metrics_before_forcing": e3.retrieval_metrics(
+                        raw_selected, list(bank["gold_statement_ids"])
+                    ),
+                    "retrieval_metrics": e3.retrieval_metrics(
+                        final_ids, list(bank["gold_statement_ids"])
+                    ),
+                    "answer_attempted": False,
+                    "prediction": None,
+                    "correct": False,
+                }
+            )
+    return result
+
+
+def summarize(rows: list[dict[str, Any]], answer_ran: bool) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "cases": len(rows),
+        "selector_before_forcing": {
+            "selector_valid_rate": average([float(row["selector_valid"]) for row in rows]),
+            "mean_statement_recall_at_k": average(
+                [row["retrieval_metrics_before_forcing"]["statement_recall_at_k"] for row in rows]
+            ),
+            "hit_rate_at_k": average(
+                [float(row["retrieval_metrics_before_forcing"]["hit_at_k"]) for row in rows]
+            ),
+            "complete_path_recall_at_k": average(
+                [
+                    float(row["retrieval_metrics_before_forcing"]["complete_path_recall_at_k"])
+                    for row in rows
+                ]
+            ),
+            "mean_selected_statement_count": average(
+                [
+                    float(row["retrieval_metrics_before_forcing"]["selected_statement_count"])
+                    for row in rows
+                ]
+            ),
+        },
+        "forced_context": {
+            "mean_statement_recall": average(
+                [row["retrieval_metrics"]["statement_recall_at_k"] for row in rows]
+            ),
+            "complete_gold_rate": average(
+                [float(row["retrieval_metrics"]["complete_path_recall_at_k"]) for row in rows]
+            ),
+            "mean_statement_count": average(
+                [float(row["retrieval_metrics"]["selected_statement_count"]) for row in rows]
+            ),
+            "mean_gold_added": average(
+                [float(row["forcing"]["gold_added_statement_count"]) for row in rows]
+            ),
+            "mean_noise_removed": average(
+                [float(row["forcing"]["removed_noise_statement_count"]) for row in rows]
+            ),
+            "context_size_preserved_rate": average(
+                [float(row["forcing"]["context_size_preserved"]) for row in rows]
+            ),
+            "context_expansion_rate": average(
+                [float(row["forcing"]["context_expanded"]) for row in rows]
+            ),
+            "invalid_selector_fallback_rate": average(
+                [float(row["forcing"]["invalid_selector_fallback_used"]) for row in rows]
+            ),
+        },
+    }
+    if answer_ran:
         correct = sum(bool(row["correct"]) for row in rows)
         invalid = sum(row["prediction"] is None for row in rows)
-        valid = len(rows) - invalid
         result["answer"] = {
             "correct": correct,
             "total": len(rows),
             "accuracy": correct / len(rows) if rows else None,
             "invalid_outputs": invalid,
-            "accuracy_on_valid_outputs": correct / valid if valid else None,
+            "invalid_rate": invalid / len(rows) if rows else None,
         }
-        result["efficiency"] = {
-            "mean_latency_seconds": average([row["latency_seconds"] for row in rows]),
+        result["answer_efficiency"] = {
+            "mean_latency_seconds": average(
+                [float(row.get("answer_latency_seconds", 0.0)) for row in rows]
+            ),
             "mean_prompt_tokens": average(
-                [float(row["usage"].get("prompt_tokens", 0)) for row in rows]
+                [float(row.get("answer_usage", {}).get("prompt_tokens", 0)) for row in rows]
             ),
             "mean_completion_tokens": average(
-                [float(row["usage"].get("completion_tokens", 0)) for row in rows]
+                [
+                    float(row.get("answer_usage", {}).get("completion_tokens", 0))
+                    for row in rows
+                ]
             ),
             "mean_total_tokens": average(
-                [float(row["usage"].get("total_tokens", 0)) for row in rows]
+                [float(row.get("answer_usage", {}).get("total_tokens", 0)) for row in rows]
             ),
         }
     return result
 
 
-def build_metrics(rows: list[dict[str, Any]], model_ran: bool, model: str | None) -> dict:
-    hops = sorted({row["hop_count"] for row in rows})
+def build_report(
+    rows: list[dict[str, Any]], configuration: dict[str, Any], answer_ran: bool
+) -> dict[str, Any]:
+    hops = sorted({int(row["hop_count"]) for row in rows})
     representations = [rep for rep in REPS if any(row["representation"] == rep for row in rows)]
     return {
-        "status": "completed" if model_ran else "build_only",
-        "condition": "E2_forced_gold_native_rag_noise",
+        "status": "completed" if answer_ran else "build_only",
+        "condition": "E2_manual_noise_forced_gold",
         "questions": len({row["question_id"] for row in rows}),
-        "contexts": len(rows),
-        "model_calls": len(rows) if model_ran else 0,
-        "model": model if model_ran else None,
+        "cases": len(rows),
+        "new_selector_calls": 0,
+        "reused_e3_selections": len(rows),
+        "answer_calls": len(rows) if answer_ran else 0,
+        "configuration": configuration,
         "by_representation": {
-            rep: summarize([row for row in rows if row["representation"] == rep], model_ran)
+            rep: summarize([row for row in rows if row["representation"] == rep], answer_ran)
             for rep in representations
         },
         "by_hop": {
@@ -264,33 +339,15 @@ def build_metrics(rows: list[dict[str, Any]], model_ran: bool, model: str | None
                     [
                         row
                         for row in rows
-                        if row["hop_count"] == hop and row["representation"] == rep
+                        if int(row["hop_count"]) == hop and row["representation"] == rep
                     ],
-                    model_ran,
+                    answer_ran,
                 )
                 for rep in representations
             }
             for hop in hops
         },
     }
-
-
-def make_prompt(item: dict[str, Any]) -> list[dict[str, str]]:
-    return [
-        {
-            "role": "system",
-            "content": "Use only retrieved context. If the answer is absent, return UNKNOWN.",
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Knowledge representation: {item['representation']}\n\n"
-                f"Retrieved context:\n{item['context']}\n\n"
-                f"Question:\n{item['question']}\n\n"
-                "Return only the exact answer entity or value."
-            ),
-        },
-    ]
 
 
 def parse_args() -> argparse.Namespace:
@@ -301,85 +358,203 @@ def parse_args() -> argparse.Namespace:
         default=ORACLE_DIR / "output" / "oracle_hops_15" / "oracle_questions.jsonl",
     )
     parser.add_argument(
-        "--retrieval-results",
+        "--candidate-banks",
         type=Path,
-        default=RAG_DIR / "output" / "rag_hops_15" / "retrieval_results.jsonl",
+        default=DEFAULT_E3_OUTPUT / "candidate_banks.jsonl",
     )
     parser.add_argument(
-        "--canonical-statements",
+        "--selection-results",
         type=Path,
-        default=RAG_DIR / "output" / "full_kb" / "canonical" / "statements.jsonl",
+        default=DEFAULT_E3_OUTPUT / "selection_results.jsonl",
     )
-    parser.add_argument("--output-dir", type=Path, default=HERE / "output" / "e2_hops_15")
     parser.add_argument(
-        "--representations",
-        nargs="+",
-        choices=REPS,
-        default=list(REPS),
-        help="Representations to run; use '--representations graph' for Graph only.",
+        "--e3-configuration",
+        type=Path,
+        default=DEFAULT_E3_OUTPUT / "configuration.json",
     )
+    parser.add_argument(
+        "--output-dir", type=Path, default=HERE / "output" / "e2_manual_hops_15"
+    )
+    parser.add_argument("--representations", nargs="+", choices=REPS, default=list(REPS))
+    parser.add_argument("--max-per-hop", type=int)
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL", ""))
     parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY", ""))
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", ""))
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--retries", type=int, default=2)
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--answer-max-tokens", type=int, default=4096)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    rows = build_bundle(args)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    oracle.write_jsonl(args.output_dir / "e2_contexts.jsonl", rows)
+    for path in (
+        args.questions,
+        args.candidate_banks,
+        args.selection_results,
+        args.e3_configuration,
+    ):
+        if not path.exists():
+            raise FileNotFoundError(path)
+    if args.max_per_hop is not None and args.max_per_hop < 1:
+        raise ValueError("--max-per-hop must be positive")
 
-    validation = {
-        "condition": "E2_forced_gold_native_rag_noise",
-        "questions": len({row["question_id"] for row in rows}),
-        "contexts": len(rows),
+    all_questions = list(e3.read_jsonl(args.questions))
+    questions = select_questions(all_questions, args.max_per_hop)
+    selected_question_ids = {str(row["question_id"]) for row in questions}
+    candidate_banks = [
+        row
+        for row in e3.read_jsonl(args.candidate_banks)
+        if str(row["question_id"]) in selected_question_ids
+    ]
+    all_selection_rows = list(e3.read_jsonl(args.selection_results))
+    selection_rows = [
+        row
+        for row in all_selection_rows
+        if str(row["question_id"]) in selected_question_ids
+        and row["representation"] in args.representations
+    ]
+    e3_config = read_json(args.e3_configuration)
+    top_k = int(e3_config["selected_top_k"])
+    if e3_config.get("representations") and not set(args.representations) <= set(
+        e3_config["representations"]
+    ):
+        raise RuntimeError("Requested representations are absent from E3 configuration")
+
+    full_candidate_banks = list(e3.read_jsonl(args.candidate_banks))
+    candidate_hash = e3.stable_digest(
+        [
+            {"question_id": row["question_id"], "ids": row["candidate_statement_ids"]}
+            for row in full_candidate_banks
+        ]
+    )
+    if candidate_hash != e3_config.get("candidate_bundle_sha256"):
+        raise RuntimeError(
+            "E3 candidate bundle hash mismatch: "
+            f"computed={candidate_hash}, configured={e3_config.get('candidate_bundle_sha256')}"
+        )
+    selected_selection_hash = selection_hash(selection_rows)
+    rows = build_bundle(
+        questions,
+        candidate_banks,
+        selection_rows,
+        list(args.representations),
+        top_k,
+    )
+
+    configuration = {
+        "source_condition": e3_config.get("condition"),
+        "source_candidate_banks": str(args.candidate_banks.resolve()),
+        "source_selection_results": str(args.selection_results.resolve()),
+        "candidate_bundle_sha256": candidate_hash,
+        "selected_selection_sha256": selected_selection_hash,
+        "source_top_k": top_k,
+        "selector_policy": "reuse_saved_e3_manual_selection",
+        "forced_context_size_rule": "max(raw_selected_count, gold_statement_count)",
+        "invalid_selector_fallback": "gold_only",
+        "prompt_version": PROMPT_VERSION,
+        "answer_prompt_shared_with_e3": True,
         "representations": list(args.representations),
-        "graph_serialization": (
-            "EDGE source_id (source_label) --[predicate]--> target_id (target_label)"
-            if "graph" in args.representations
-            else None
-        ),
-        "source": str(args.retrieval_results),
-        "all_gold_present": all(row["final_complete_gold"] for row in rows),
-        "statement_count_preserved": all(
-            row["original_statement_count"] == row["final_statement_count"] for row in rows
-        ),
-        "gold_used_for_original_retrieval": False,
-        "gold_used_only_after_retrieval": True,
-        "native_noise_per_representation": True,
-        "existing_experiments_modified": False,
+        "max_per_hop": args.max_per_hop,
+        "model": args.model or None,
+        "answer_max_tokens": args.answer_max_tokens,
+        "temperature": 0,
     }
-    oracle.write_json(args.output_dir / "bundle_validation.json", validation)
+    validation = {
+        "condition": "E2_manual_noise_forced_gold",
+        "questions": len(questions),
+        "cases": len(rows),
+        "by_hop": dict(Counter(str(row["hop_count"]) for row in questions)),
+        "candidate_bundle_hash_matches_e3": True,
+        "selection_reused_from_e3": True,
+        "new_selector_calls": 0,
+        "all_gold_present_after_forcing": all(
+            row["retrieval_metrics"]["complete_path_recall_at_k"] for row in rows
+        ),
+        "all_forced_contexts_within_e3_top_k": all(
+            len(row["selected_statement_ids"]) <= top_k for row in rows
+        ),
+        "candidate_ids_and_order_shared_across_representations": True,
+        "answer_prompt_shared_with_e3": True,
+    }
+    if not all(
+        value is True
+        for key, value in validation.items()
+        if key
+        not in {"questions", "cases", "by_hop", "new_selector_calls", "condition"}
+    ):
+        raise RuntimeError(f"E2 validation failed: {validation}")
 
-    model_ran = not args.build_only and bool(args.base_url and args.model)
-    if model_ran:
-        for number, item in enumerate(rows, 1):
-            started = time.perf_counter()
-            raw, usage = oracle.call_chat_completions(
-                args.base_url,
-                args.api_key,
-                args.model,
-                make_prompt(item),
-                args.timeout,
-                args.retries,
-                args.max_tokens,
-            )
-            item["latency_seconds"] = time.perf_counter() - started
-            item["prediction"] = oracle.extract_choice(raw, item["choices"])
-            item["raw_response"] = raw
-            item["correct"] = oracle.normalized_equal(item["prediction"], item["answer"])
-            item["usage"] = usage
-            print(f"Completed {number}/{len(rows)}", flush=True)
-        oracle.write_jsonl(args.output_dir / "predictions.jsonl", rows)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    e3.write_jsonl(args.output_dir / "e2_contexts.jsonl", rows)
+    e3.write_json(args.output_dir / "configuration.json", configuration)
+    e3.write_json(args.output_dir / "bundle_validation.json", validation)
+    model_configured = bool(args.base_url and args.model)
+    if args.build_only or not model_configured:
+        report = build_report(rows, configuration, answer_ran=False)
+        report["validation"] = validation
+        e3.write_json(args.output_dir / "metrics.json", report)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
 
-    report = build_metrics(rows, model_ran, args.model)
+    run_signature = e3.stable_digest(
+        {
+            "candidate_bundle_sha256": candidate_hash,
+            "selected_selection_sha256": selected_selection_hash,
+            "model": args.model,
+            "representations": args.representations,
+            "max_per_hop": args.max_per_hop,
+            "answer_max_tokens": args.answer_max_tokens,
+            "prompt_version": PROMPT_VERSION,
+        }
+    )
+    checkpoint_path = args.output_dir / "e2_results_checkpoint.jsonl"
+    completed: dict[tuple[str, str], dict[str, Any]] = {}
+    if checkpoint_path.exists():
+        for saved in e3.read_jsonl(checkpoint_path):
+            if saved.get("run_signature") == run_signature:
+                completed[(str(saved["question_id"]), saved["representation"])] = saved
+
+    for number, row in enumerate(rows, 1):
+        key = (str(row["question_id"]), row["representation"])
+        if key in completed:
+            continue
+        started = time.perf_counter()
+        raw, usage = e3.oracle_base.call_chat_completions(
+            args.base_url,
+            args.api_key,
+            args.model,
+            e3.answer_prompt(
+                row["question"], row["selected_context"], row["representation"]
+            ),
+            args.timeout,
+            args.retries,
+            args.answer_max_tokens,
+        )
+        row["run_signature"] = run_signature
+        row["answer_latency_seconds"] = time.perf_counter() - started
+        row["answer_attempted"] = True
+        row["answer_raw_response"] = raw
+        row["answer_usage"] = usage
+        row["prediction"] = e3.oracle_base.extract_choice(raw, row["choices"])
+        row["correct"] = e3.oracle_base.normalized_equal(row["prediction"], row["answer"])
+        e3.append_jsonl(checkpoint_path, row)
+        completed[key] = row
+        print(f"Completed {number}/{len(rows)}", flush=True)
+
+    question_order = {str(row["question_id"]): index for index, row in enumerate(questions)}
+    final_rows = sorted(
+        completed.values(),
+        key=lambda row: (
+            question_order[str(row["question_id"])],
+            REPS.index(row["representation"]),
+        ),
+    )
+    e3.write_jsonl(args.output_dir / "predictions.jsonl", final_rows)
+    report = build_report(final_rows, configuration, answer_ran=True)
     report["validation"] = validation
-    oracle.write_json(args.output_dir / "metrics.json", report)
+    e3.write_json(args.output_dir / "metrics.json", report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
