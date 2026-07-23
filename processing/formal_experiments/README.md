@@ -1,0 +1,143 @@
+# Formal E0-E3 experiments
+
+This directory freezes and runs the formal KQA Pro and GrailQA experiments for
+Qwen (`qwen3-4b-16k`) and OpenAI (`gpt-5.4-2026-03-05`).
+
+Formal sampling is fixed to:
+
+```text
+1-hop: 100
+2-hop: 100
+3-hop:  60
+total: 260 questions per dataset
+```
+
+Previously used development questions are excluded by default:
+
+- the 15-question KQA Pro pilot;
+- the 30-question GrailQA pilot.
+
+This prevents smoke/pilot-driven prompt and pipeline decisions from leaking
+into the formal evaluation.
+
+On the current machine, use the working Python 3.12 interpreter:
+
+```powershell
+$py = "C:\Users\why\AppData\Local\Programs\Python\Python312\python.exe"
+```
+
+Every model uses the same frozen questions. Candidate statement IDs, candidate
+order, noise source and noise seed are shared across Document, Triple and
+Graph. E2 always reads the saved E3 selections from the same model run; it
+never launches a new selector.
+
+At formal scale, selecting 60 executable 3-hop evaluation questions leaves
+fewer than the pilot's requested 50 non-evaluation 3-hop background paths.
+The formal KQA runner therefore preserves up to 50 paths per hop and then
+deterministically fills the shared true-fact noise bank from remaining
+non-evaluation paths in round-robin hop order. Each candidate bank still
+contains exactly 100 statements and applies the same answer/distractor leakage
+filters. The accepted path counts and final noise-bank size are audited in the
+generated configuration.
+
+## 1. Build KQA Pro inputs
+
+No model or network call is used:
+
+```powershell
+& $py processing/formal_experiments/build_kqapro_formal_manifest.py
+```
+
+Output:
+
+```text
+processing/formal_experiments/output/inputs/kqapro_100_100_60/
+```
+
+## 2. Build GrailQA inputs
+
+First validate that the dev set has enough eligible questions and that SPARQL
+queries can be prepared. This does not contact Virtuoso:
+
+```powershell
+& $py processing/formal_experiments/build_grailqa_formal_inputs.py --dry-run
+```
+
+Then make sure the Freebase Virtuoso endpoint is running and materialize the
+formal mini-KB:
+
+```powershell
+$env:GRAILQA_SPARQL_ENDPOINT = "http://localhost:3001/sparql"
+& $py processing/formal_experiments/build_grailqa_formal_inputs.py
+```
+
+The materializer is resumable. It uses separate per-hop checkpoints because
+the formal sample sizes are non-uniform.
+
+Output:
+
+```text
+processing/formal_experiments/output/inputs/grailqa_100_100_60/
+```
+
+## 3. Review a frozen run plan
+
+The command below validates the formal input and writes `run_plan.json`; it
+does not call a model unless `--execute` is added.
+
+KQA Pro with GPT-5.4:
+
+```powershell
+& $py processing/formal_experiments/run_formal_experiment.py `
+  --dataset kqapro --backend openai
+```
+
+KQA Pro with Qwen:
+
+```powershell
+& $py processing/formal_experiments/run_formal_experiment.py `
+  --dataset kqapro --backend ollama
+```
+
+GrailQA with GPT-5.4:
+
+```powershell
+& $py processing/formal_experiments/run_formal_experiment.py `
+  --dataset grailqa --backend openai
+```
+
+GrailQA with Qwen:
+
+```powershell
+& $py processing/formal_experiments/run_formal_experiment.py `
+  --dataset grailqa --backend ollama
+```
+
+## 4. Execute
+
+After inspecting `run_plan.json`, repeat a command with `--execute`. The runner
+executes stages in the required order:
+
+```text
+E0 -> E1 -> E3 -> E2
+```
+
+Example:
+
+```powershell
+& $py processing/formal_experiments/run_formal_experiment.py `
+  --dataset kqapro --backend openai --execute
+```
+
+Default outputs:
+
+```text
+processing/formal_experiments/output/runs/
+  kqapro/openai/gpt-5.4-2026-03-05/{e0,e1,e3,e2}
+  kqapro/ollama/qwen3-4b-16k/{e0,e1,e3,e2}
+  grailqa/openai/gpt-5.4-2026-03-05/{e0,e1,e3,e2}
+  grailqa/ollama/qwen3-4b-16k/{e0,e1,e3,e2}
+```
+
+Do not reuse an E3 selection file across models. OpenAI and Ollama runs must
+remain in their separate output roots.
