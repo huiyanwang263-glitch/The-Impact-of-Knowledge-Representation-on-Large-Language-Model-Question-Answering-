@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-backoff", type=float, default=1.0)
     parser.add_argument("--max-consecutive-endpoint-failures", type=int, default=3)
     parser.add_argument("--label-batch-size", type=int, default=100)
+    parser.add_argument(
+        "--max-sufficient-gold-statements",
+        type=int,
+        default=50,
+        help="Reject questions whose deterministic sufficient Gold union exceeds this size.",
+    )
     parser.add_argument("--skip-labels", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument(
@@ -230,6 +236,8 @@ def run_parts(args: argparse.Namespace, counts: dict[int, int]) -> None:
             str(args.max_consecutive_endpoint_failures),
             "--label-batch-size",
             str(args.label_batch_size),
+            "--max-sufficient-gold-statements",
+            str(args.max_sufficient_gold_statements),
         ]
         if args.skip_labels:
             command.append("--skip-labels")
@@ -329,6 +337,10 @@ def merge_parts(args: argparse.Namespace, counts: dict[int, int]) -> dict[str, A
         "materialized_questions": len(questions),
         "materialized_by_hop": {str(hop): actual[hop] for hop in sorted(actual)},
         "canonical_statement_count": len(statements),
+        "max_sufficient_gold_statements": args.max_sufficient_gold_statements,
+        "maximum_selected_sufficient_gold_statement_count": max(
+            len(row["sufficient_gold_statement_ids"]) for row in questions
+        ),
         "unique_question_ids": True,
         "selected_questions_sha256": sha256_file(
             args.output_dir / "selected_questions.jsonl"

@@ -12,6 +12,11 @@ Formal sampling is fixed to:
 total: 260 questions per dataset
 ```
 
+For GrailQA, a question is admitted only when the deterministic union of one
+grounded proof path per Gold answer contains at most 50 statements. This keeps
+every complete Gold proof theoretically retrievable under the fixed E3
+`top_k=50` selector budget and excludes very broad answer-set questions.
+
 Previously used development questions are excluded by default:
 
 - the 15-question KQA Pro pilot;
@@ -30,6 +35,11 @@ Every model uses the same frozen questions. Candidate statement IDs, candidate
 order, noise source and noise seed are shared across Document, Triple and
 Graph. E2 always reads the saved E3 selections from the same model run; it
 never launches a new selector.
+
+GrailQA E1, E2 and E3 share the same persisted
+`sufficient_gold_statement_ids`. E1 provides only this minimal grounded proof
+union; E2 inserts any missing sufficient-Gold statements after reusing E3's
+selection; E3 never forces Gold into the selected context.
 
 At formal scale, selecting 60 executable 3-hop evaluation questions leaves
 fewer than the pilot's requested 50 non-evaluation 3-hop background paths.

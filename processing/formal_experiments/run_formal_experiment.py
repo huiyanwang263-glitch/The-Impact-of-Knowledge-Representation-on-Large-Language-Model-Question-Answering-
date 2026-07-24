@@ -110,6 +110,44 @@ def validate_inputs(dataset: str, input_dir: Path) -> dict[str, Any]:
     ]
     if len(ids) != len(set(ids)):
         raise RuntimeError("Formal question IDs are not unique")
+    sufficient_gold_counts: list[int] | None = None
+    max_answer_count: int | None = None
+    if dataset == "grailqa":
+        missing_sufficient = [
+            str(row["question_id"])
+            for row in rows
+            if not row.get("sufficient_gold_statement_ids")
+        ]
+        if missing_sufficient:
+            raise RuntimeError(
+                "Formal GrailQA questions miss sufficient Gold paths: "
+                f"{missing_sufficient[:20]}"
+            )
+        non_subsets = [
+            str(row["question_id"])
+            for row in rows
+            if not set(row["sufficient_gold_statement_ids"])
+            <= set(row["gold_statement_ids"])
+        ]
+        if non_subsets:
+            raise RuntimeError(
+                "Sufficient Gold is not a subset of materialized Gold: "
+                f"{non_subsets[:20]}"
+            )
+        sufficient_gold_counts = [
+            len(row["sufficient_gold_statement_ids"]) for row in rows
+        ]
+        if max(sufficient_gold_counts) > 50:
+            raise RuntimeError(
+                "Formal GrailQA sufficient Gold exceeds selector top-k 50: "
+                f"{max(sufficient_gold_counts)}"
+            )
+        max_answer_count = max(len(row["answer_ids"]) for row in rows)
+        if max_answer_count > 128:
+            raise RuntimeError(
+                "Formal GrailQA answer count exceeds structured-output limit 128: "
+                f"{max_answer_count}"
+            )
     return {
         "questions": str(questions.resolve()),
         "questions_sha256": sha256_file(questions),
@@ -130,6 +168,13 @@ def validate_inputs(dataset: str, input_dir: Path) -> dict[str, Any]:
             if dataset == "grailqa"
             else None
         ),
+        "sufficient_gold_statement_count_min": (
+            min(sufficient_gold_counts) if sufficient_gold_counts else None
+        ),
+        "sufficient_gold_statement_count_max": (
+            max(sufficient_gold_counts) if sufficient_gold_counts else None
+        ),
+        "maximum_answer_count": max_answer_count,
     }
 
 
@@ -222,6 +267,8 @@ def stage_commands(
         command += ["--questions", str(questions), "--alias-cache", str(alias_cache)]
         if stage in {"e1", "e2", "e3"}:
             command += ["--kb", str(kb)]
+        if stage == "e1":
+            command += ["--gold-context", "sufficient"]
         if stage in {"e2", "e3"}:
             command += [
                 "--query-results",
@@ -295,6 +342,7 @@ def main() -> None:
             "kqapro_top_k": 20,
             "grailqa_noise_statements": 100,
             "grailqa_top_k": 50,
+            "grailqa_max_sufficient_gold_statements": 50,
         },
         "git": git_state(),
         "commands": commands,

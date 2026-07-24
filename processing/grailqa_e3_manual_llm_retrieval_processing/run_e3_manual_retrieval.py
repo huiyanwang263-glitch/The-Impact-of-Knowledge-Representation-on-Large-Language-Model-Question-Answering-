@@ -275,6 +275,16 @@ def candidate_banks(
         gold_ids, gold_paths = sufficient_gold(
             question, query_results[qid], kb_by_id, labels
         )
+        persisted_gold_ids = question.get("sufficient_gold_statement_ids")
+        if persisted_gold_ids is not None and list(persisted_gold_ids) != gold_ids:
+            raise RuntimeError(
+                f"Persisted sufficient Gold differs from recomputed Gold for {qid}"
+            )
+        persisted_paths = question.get("sufficient_gold_paths_by_answer")
+        if persisted_paths is not None and dict(persisted_paths) != gold_paths:
+            raise RuntimeError(
+                f"Persisted sufficient Gold paths differ from recomputed paths for {qid}"
+            )
         gold_set = set(gold_ids)
         answer_ids = set(str(mid) for mid in question["answer_ids"])
         eligible_noise = [

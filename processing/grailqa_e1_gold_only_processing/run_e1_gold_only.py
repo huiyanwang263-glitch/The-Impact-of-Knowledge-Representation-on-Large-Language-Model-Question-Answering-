@@ -90,11 +90,21 @@ def render_context(
 
 
 def build_cases(
-    questions: list[dict[str, Any]], kb_by_id: dict[str, dict[str, Any]]
+    questions: list[dict[str, Any]],
+    kb_by_id: dict[str, dict[str, Any]],
+    gold_context: str,
 ) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     for question in questions:
-        statement_ids = list(question["gold_statement_ids"])
+        if gold_context == "sufficient":
+            if "sufficient_gold_statement_ids" not in question:
+                raise RuntimeError(
+                    f"Question {question['question_id']} does not contain "
+                    "sufficient_gold_statement_ids"
+                )
+            statement_ids = list(question["sufficient_gold_statement_ids"])
+        else:
+            statement_ids = list(question["gold_statement_ids"])
         missing = [statement_id for statement_id in statement_ids if statement_id not in kb_by_id]
         if missing:
             raise RuntimeError(
@@ -206,6 +216,15 @@ def parse_args() -> argparse.Namespace:
         "--output-dir", type=Path, default=HERE / "output" / "e1_gold_30"
     )
     parser.add_argument("--max-per-hop", type=int)
+    parser.add_argument(
+        "--gold-context",
+        choices=["materialized", "sufficient"],
+        default="materialized",
+        help=(
+            "Use every materialized SPARQL edge or the deterministic minimal "
+            "proof union persisted with each question."
+        ),
+    )
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument(
         "--base-url",
@@ -232,7 +251,7 @@ def main() -> None:
     kb_by_id = {row["statement_id"]: row for row in kb_rows}
     if len(kb_by_id) != len(kb_rows):
         raise RuntimeError("mini_kb.jsonl contains duplicate statement IDs")
-    cases = build_cases(selected, kb_by_id)
+    cases = build_cases(selected, kb_by_id, args.gold_context)
     alias_cache, alias_metadata = e0.load_alias_cache(args.alias_cache)
     required_gold_ids = {mid for case in cases for mid in case["gold_answer_ids"]}
     missing_alias_ids = sorted(required_gold_ids - set(alias_cache))
@@ -257,6 +276,7 @@ def main() -> None:
         },
         "representations": list(REPRESENTATIONS),
         "gold_context_only": True,
+        "gold_context_definition": args.gold_context,
         "complete_gold_loaded": all(case["gold_statement_count"] > 0 for case in cases),
         "noise_statement_count": 0,
         "retrieval_used": False,
@@ -332,6 +352,7 @@ def main() -> None:
 
     configuration = {
         "gold_context_only": True,
+        "gold_context_definition": args.gold_context,
         "noise_statement_count": 0,
         "retrieval_used": False,
         "temperature": 0,
@@ -351,4 +372,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

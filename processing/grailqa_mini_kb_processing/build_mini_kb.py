@@ -97,6 +97,43 @@ def load_latest_checkpoints(path: Path) -> dict[str, dict[str, Any]]:
     return latest
 
 
+def sufficient_gold(
+    helper: ModuleType,
+    item: dict[str, Any],
+    bindings: list[dict[str, dict[str, Any]]],
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Choose one deterministic grounded proof path for every Gold answer."""
+    variable = helper.question_variable(item)
+    by_answer: dict[str, list[dict[str, dict[str, Any]]]] = {}
+    for binding in bindings:
+        answer_id = helper.normalize_answer_id(binding[variable]["id"])
+        by_answer.setdefault(answer_id, []).append(binding)
+
+    ordered_ids: list[str] = []
+    paths: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for answer in item["answer"]:
+        answer_id = helper.normalize_answer_id(answer["answer_argument"])
+        alternatives = by_answer.get(answer_id, [])
+        if not alternatives:
+            raise ValueError(f"No grounded binding for Gold answer {answer_id}")
+        alternatives.sort(
+            key=lambda binding: helper.compact_json(
+                {name: value["id"] for name, value in binding.items()}
+            )
+        )
+        binding = alternatives[0]
+        path_ids: list[str] = []
+        for edge in item["graph_query"]["edges"]:
+            statement_id = helper.build_statement(edge, binding, {})["statement_id"]
+            path_ids.append(statement_id)
+            if statement_id not in seen:
+                seen.add(statement_id)
+                ordered_ids.append(statement_id)
+        paths[answer_id] = path_ids
+    return ordered_ids, paths
+
+
 def serialize_statement(statement: dict[str, Any]) -> dict[str, Any]:
     subject = statement["subject"]
     obj = statement["object"]
@@ -127,6 +164,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-backoff", type=float, default=1.0)
     parser.add_argument("--max-consecutive-endpoint-failures", type=int, default=3)
     parser.add_argument("--label-batch-size", type=int, default=100)
+    parser.add_argument(
+        "--max-sufficient-gold-statements",
+        type=int,
+        help=(
+            "Skip otherwise valid questions whose deterministic sufficient Gold "
+            "proof union exceeds this size."
+        ),
+    )
     parser.add_argument("--skip-labels", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
@@ -142,6 +187,11 @@ def main() -> None:
         raise ValueError("--hops must contain only 1, 2, and/or 3")
     if args.questions_per_hop < 1:
         raise ValueError("--questions-per-hop must be positive")
+    if (
+        args.max_sufficient_gold_statements is not None
+        and args.max_sufficient_gold_statements < 1
+    ):
+        raise ValueError("--max-sufficient-gold-statements must be positive")
 
     hops = sorted(set(args.hops))
     data = json.loads(args.data.read_text(encoding="utf-8"))
@@ -222,6 +272,7 @@ def main() -> None:
         },
         "queries_prepared": len(prepared),
         "query_rewrite_failures": len(preparation_failures),
+        "max_sufficient_gold_statements": args.max_sufficient_gold_statements,
         "dry_run": args.dry_run,
     }
     if args.dry_run:
@@ -257,6 +308,35 @@ def main() -> None:
                 and cached.get("query_hash") == query_hash
                 and cached.get("endpoint") == args.endpoint
             ):
+                sufficient_ids, _ = sufficient_gold(
+                    helper, item, cached["bindings"]
+                )
+                if (
+                    args.max_sufficient_gold_statements is not None
+                    and len(sufficient_ids) > args.max_sufficient_gold_statements
+                ):
+                    row = {
+                        "status": "failure",
+                        "question_id": question_id,
+                        "hop_count": hop,
+                        "candidate_rank": candidate_rank,
+                        "dataset_index": dataset_index,
+                        "query_hash": query_hash,
+                        "endpoint": args.endpoint,
+                        "stage": "sufficient_gold_limit",
+                        "sufficient_gold_statement_count": len(sufficient_ids),
+                        "max_sufficient_gold_statements": (
+                            args.max_sufficient_gold_statements
+                        ),
+                        "error": (
+                            f"Sufficient Gold size {len(sufficient_ids)} exceeds "
+                            f"limit {args.max_sufficient_gold_statements}"
+                        ),
+                    }
+                    append_jsonl(checkpoint_path, row)
+                    latest[question_id] = row
+                    latest_failures[question_id] = row
+                    continue
                 selected_ids[hop].append(question_id)
                 latest_failures.pop(question_id, None)
                 continue
@@ -277,6 +357,40 @@ def main() -> None:
                         "Denotation mismatch: "
                         f"expected={sorted(expected)!r}, observed={sorted(observed)!r}"
                     )
+                sufficient_ids, _ = sufficient_gold(helper, item, bindings)
+                if (
+                    args.max_sufficient_gold_statements is not None
+                    and len(sufficient_ids) > args.max_sufficient_gold_statements
+                ):
+                    row = {
+                        "status": "failure",
+                        "question_id": question_id,
+                        "hop_count": hop,
+                        "candidate_rank": candidate_rank,
+                        "dataset_index": dataset_index,
+                        "query_hash": query_hash,
+                        "endpoint": args.endpoint,
+                        "stage": "sufficient_gold_limit",
+                        "sufficient_gold_statement_count": len(sufficient_ids),
+                        "max_sufficient_gold_statements": (
+                            args.max_sufficient_gold_statements
+                        ),
+                        "error": (
+                            f"Sufficient Gold size {len(sufficient_ids)} exceeds "
+                            f"limit {args.max_sufficient_gold_statements}"
+                        ),
+                    }
+                    append_jsonl(checkpoint_path, row)
+                    latest[question_id] = row
+                    latest_failures[question_id] = row
+                    consecutive_endpoint_failures = 0
+                    print(
+                        f"hop={hop}: skipped candidate rank {candidate_rank}; "
+                        f"sufficient Gold size {len(sufficient_ids)} exceeds "
+                        f"{args.max_sufficient_gold_statements}",
+                        flush=True,
+                    )
+                    continue
                 row = {
                     "status": "success",
                     "question_id": question_id,
@@ -288,6 +402,7 @@ def main() -> None:
                     "variables": prep["variables"],
                     "bindings": bindings,
                     "incomplete_bindings": incomplete,
+                    "sufficient_gold_statement_count": len(sufficient_ids),
                 }
                 append_jsonl(checkpoint_path, row)
                 latest[question_id] = row
@@ -379,6 +494,16 @@ def main() -> None:
             )
             record["candidate_rank"] = prep["candidate_rank"]
             record["materialized_from_endpoint"] = args.endpoint
+            sufficient_ids, sufficient_paths = sufficient_gold(
+                helper, prep["item"], result["bindings"]
+            )
+            record["sufficient_gold_statement_ids"] = sufficient_ids
+            record["sufficient_gold_paths_by_answer"] = sufficient_paths
+            if not set(sufficient_ids) <= set(record["gold_statement_ids"]):
+                raise RuntimeError(
+                    f"Sufficient Gold is not contained in materialized Gold for "
+                    f"{question_id}"
+                )
             questions.append(record)
             for statement in record["gold_statements"]:
                 statement_id = statement["statement_id"]
@@ -418,6 +543,18 @@ def main() -> None:
         "materialized_questions": len(questions),
         "materialized_by_hop": dict(selected_counts),
         "canonical_statement_count": len(statements),
+        "maximum_selected_sufficient_gold_statement_count": (
+            max(
+                len(question["sufficient_gold_statement_ids"])
+                for question in questions
+            )
+            if questions
+            else 0
+        ),
+        "sufficient_gold_limit_failure_count": sum(
+            row.get("stage") == "sufficient_gold_limit"
+            for row in latest_failures.values()
+        ),
         "current_failure_count": len(latest_failures),
         "endpoint_abort_reason": endpoint_abort_reason,
         "label_lookup_failure_batches": len(label_failures),
