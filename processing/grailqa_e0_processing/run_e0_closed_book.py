@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import string
 import time
 import unicodedata
@@ -52,8 +51,10 @@ def normalize_answer(value: str) -> str:
     value = unicodedata.normalize("NFKC", value).casefold().strip()
     value = value.replace("–", "-").replace("—", "-")
     value = "".join(" " if char in string.punctuation else char for char in value)
-    value = re.sub(r"\b(a|an|the)\b", " ", value)
-    return " ".join(value.split())
+    tokens = value.split()
+    if len(tokens) > 1:
+        tokens = [token for token in tokens if token not in {"a", "an", "the"}]
+    return " ".join(tokens)
 
 
 def normalized_set(values: Iterable[str]) -> set[str]:
@@ -85,7 +86,15 @@ def load_alias_cache(path: Path) -> tuple[dict[str, set[str]], dict[str, Any]]:
     aliases: dict[str, set[str]] = {}
     for mid, row in entities.items():
         values = row.get("accepted_normalized_aliases", [])
-        aliases[str(mid)] = {str(value) for value in values if str(value)}
+        normalized_values = {str(value) for value in values if str(value)}
+        for canonical_name in row.get("canonical_names", []):
+            if normalized := normalize_answer(str(canonical_name)):
+                normalized_values.add(normalized)
+        for alias in row.get("aliases", []):
+            for surface_form in alias.get("surface_forms", []):
+                if normalized := normalize_answer(str(surface_form)):
+                    normalized_values.add(normalized)
+        aliases[str(mid)] = normalized_values
     metadata = {
         "path": str(path.resolve()),
         "cache_sha256": payload.get("cache_sha256"),
@@ -94,43 +103,95 @@ def load_alias_cache(path: Path) -> tuple[dict[str, set[str]], dict[str, Any]]:
         "normalized_alias_count": payload.get("audit", {}).get(
             "normalized_alias_count"
         ),
+        "evaluation_normalization_version": 2,
+        "raw_surface_forms_renormalized": True,
     }
     return aliases, metadata
 
 
-def maximum_alias_matching(
-    predicted: list[str], gold_ids: list[str], alias_cache: dict[str, set[str]]
-) -> list[tuple[int, str]]:
-    """Return maximum one-to-one matches as (prediction index, Gold MID)."""
+def build_alias_gold_groups(
+    gold: list[str],
+    gold_ids: list[str],
+    alias_cache: dict[str, set[str]],
+) -> list[dict[str, Any]]:
+    """Group indistinguishable Gold MIDs by their normalized answer label."""
+    if len(gold) != len(gold_ids):
+        raise ValueError(
+            "gold answers and gold IDs must have equal lengths: "
+            f"{len(gold)} != {len(gold_ids)}"
+        )
+    groups: dict[str, dict[str, Any]] = {}
+    for answer, raw_mid in zip(gold, gold_ids):
+        mid = str(raw_mid)
+        normalized = normalize_answer(answer)
+        if not normalized:
+            continue
+        group_key = normalized
+        group = groups.setdefault(
+            group_key,
+            {
+                "group_key": group_key,
+                "canonical_answers": [],
+                "gold_mids": [],
+                "accepted_normalized_aliases": set(),
+            },
+        )
+        if answer not in group["canonical_answers"]:
+            group["canonical_answers"].append(answer)
+        if mid not in group["gold_mids"]:
+            group["gold_mids"].append(mid)
+        if normalized:
+            group["accepted_normalized_aliases"].add(normalized)
+        group["accepted_normalized_aliases"].update(alias_cache.get(mid, set()))
+    return list(groups.values())
+
+
+def maximum_alias_group_matching(
+    predicted: list[str],
+    gold_groups: list[dict[str, Any]],
+) -> list[tuple[int, int]]:
+    """Return maximum one-to-one matches as (prediction index, Gold group index)."""
     normalized_predictions = [normalize_answer(value) for value in predicted]
     adjacency = [
-        [mid for mid in gold_ids if normalized and normalized in alias_cache.get(mid, set())]
+        [
+            group_index
+            for group_index, group in enumerate(gold_groups)
+            if normalized
+            and normalized in group["accepted_normalized_aliases"]
+        ]
         for normalized in normalized_predictions
     ]
-    mid_to_prediction: dict[str, int] = {}
+    group_to_prediction: dict[int, int] = {}
 
-    def augment(prediction_index: int, visited: set[str]) -> bool:
-        for mid in adjacency[prediction_index]:
-            if mid in visited:
+    def augment(prediction_index: int, visited: set[int]) -> bool:
+        for group_index in adjacency[prediction_index]:
+            if group_index in visited:
                 continue
-            visited.add(mid)
-            previous = mid_to_prediction.get(mid)
+            visited.add(group_index)
+            previous = group_to_prediction.get(group_index)
             if previous is None or augment(previous, visited):
-                mid_to_prediction[mid] = prediction_index
+                group_to_prediction[group_index] = prediction_index
                 return True
         return False
 
     for prediction_index in range(len(predicted)):
         augment(prediction_index, set())
     return sorted(
-        ((prediction_index, mid) for mid, prediction_index in mid_to_prediction.items()),
+        (
+            (prediction_index, group_index)
+            for group_index, prediction_index in group_to_prediction.items()
+        ),
         key=lambda pair: pair[0],
     )
 
 
 def score_alias_answer_set(
-    predicted: list[str], gold_ids: list[str], alias_cache: dict[str, set[str]]
+    predicted: list[str],
+    gold: list[str],
+    gold_ids: list[str],
+    alias_cache: dict[str, set[str]],
 ) -> dict[str, Any]:
+    """Score aliases against answer-label groups rather than raw Freebase MIDs."""
     unique_predictions: list[str] = []
     seen: set[str] = set()
     for value in predicted:
@@ -138,17 +199,19 @@ def score_alias_answer_set(
         if normalized and normalized not in seen:
             seen.add(normalized)
             unique_predictions.append(value)
-    unique_gold_ids = list(dict.fromkeys(str(mid) for mid in gold_ids))
-    matches = maximum_alias_matching(unique_predictions, unique_gold_ids, alias_cache)
+    gold_groups = build_alias_gold_groups(gold, gold_ids, alias_cache)
+    matches = maximum_alias_group_matching(unique_predictions, gold_groups)
     matched_prediction_indexes = {index for index, _ in matches}
-    matched_gold_ids = {mid for _, mid in matches}
+    matched_group_indexes = {group_index for _, group_index in matches}
     matched_count = len(matches)
     precision = matched_count / len(unique_predictions) if unique_predictions else 0.0
-    recall = matched_count / len(unique_gold_ids) if unique_gold_ids else 0.0
+    recall = matched_count / len(gold_groups) if gold_groups else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {
+        "alias_scoring_version": 2,
+        "alias_scoring_unit": "normalized_gold_answer_group",
         "alias_answer_set_em": (
-            matched_count == len(unique_gold_ids) == len(unique_predictions)
+            matched_count == len(gold_groups) == len(unique_predictions)
         ),
         "alias_answer_precision": precision,
         "alias_answer_recall": recall,
@@ -157,18 +220,52 @@ def score_alias_answer_set(
             {
                 "prediction": unique_predictions[index],
                 "normalized_prediction": normalize_answer(unique_predictions[index]),
-                "gold_mid": mid,
+                "gold_group": gold_groups[group_index]["group_key"],
+                "gold_mids": gold_groups[group_index]["gold_mids"],
             }
-            for index, mid in matches
+            for index, group_index in matches
         ],
         "unmatched_predictions": [
             value
             for index, value in enumerate(unique_predictions)
             if index not in matched_prediction_indexes
         ],
-        "unmatched_gold_ids": [
-            mid for mid in unique_gold_ids if mid not in matched_gold_ids
+        "alias_gold_group_count": len(gold_groups),
+        "alias_gold_groups": [
+            {
+                "group_key": group["group_key"],
+                "canonical_answers": group["canonical_answers"],
+                "gold_mids": group["gold_mids"],
+            }
+            for group in gold_groups
         ],
+        "unmatched_gold_groups": [
+            {
+                "group_key": group["group_key"],
+                "canonical_answers": group["canonical_answers"],
+                "gold_mids": group["gold_mids"],
+            }
+            for group_index, group in enumerate(gold_groups)
+            if group_index not in matched_group_indexes
+        ],
+        "unmatched_gold_ids": [
+            mid
+            for group_index, group in enumerate(gold_groups)
+            if group_index not in matched_group_indexes
+            for mid in group["gold_mids"]
+        ],
+    }
+
+
+def evaluation_metadata(alias_cache_metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "canonical_unit": "normalized_answer_string_set",
+        "alias_aware_unit": "normalized_gold_answer_group",
+        "gold_mids_with_same_normalized_answer_are_grouped": True,
+        "normalization_version": 2,
+        "single_token_articles_are_preserved": True,
+        "alias_cache": alias_cache_metadata,
     }
 
 
@@ -431,7 +528,10 @@ def main() -> None:
             predicted, item["gold_answers"]
         )
         alias_scores = score_alias_answer_set(
-            predicted, item["gold_answer_ids"], alias_cache
+            predicted,
+            item["gold_answers"],
+            item["gold_answer_ids"],
+            alias_cache,
         )
         predictions.append(
             {
@@ -451,10 +551,12 @@ def main() -> None:
 
     report = {
         "status": "completed",
+        "metrics_schema_version": 2,
         "condition": "E0_grailqa_closed_book",
         "model": args.model,
         "questions": len(questions),
         "calls": len(predictions),
+        "evaluation": evaluation_metadata(alias_cache_metadata),
         "configuration": {
             "knowledge_context_provided": False,
             "retrieval_used": False,

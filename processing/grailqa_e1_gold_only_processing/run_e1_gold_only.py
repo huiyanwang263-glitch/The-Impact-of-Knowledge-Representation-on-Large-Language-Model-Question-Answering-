@@ -176,10 +176,12 @@ def metrics_report(
     hops = sorted({row["hop_count"] for row in predictions})
     return {
         "status": "completed",
+        "metrics_schema_version": 2,
         "condition": "E1_grailqa_gold_only",
         "model": model,
         "questions": validation["questions"],
         "calls": len(predictions),
+        "evaluation": e0.evaluation_metadata(configuration["alias_cache"]),
         "configuration": configuration,
         "by_representation": {
             representation: summarize_predictions(
@@ -337,7 +339,10 @@ def main() -> None:
                     "parse_error": parse_error,
                     **e0.score_canonical_answer_set(predicted, case["gold_answers"]),
                     **e0.score_alias_answer_set(
-                        predicted, case["gold_answer_ids"], alias_cache
+                        predicted,
+                        case["gold_answers"],
+                        case["gold_answer_ids"],
+                        alias_cache,
                     ),
                     "usage": usage,
                     "latency_seconds": latency,

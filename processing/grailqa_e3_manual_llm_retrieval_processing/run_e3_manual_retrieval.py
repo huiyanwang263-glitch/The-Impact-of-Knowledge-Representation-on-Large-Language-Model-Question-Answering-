@@ -793,7 +793,12 @@ def main() -> None:
                 "output_valid": False,
                 "parse_error": None,
                 **e0.score_canonical_answer_set([], bank["gold_answers"]),
-                **e0.score_alias_answer_set([], bank["gold_answer_ids"], alias_cache),
+                **e0.score_alias_answer_set(
+                    [],
+                    bank["gold_answers"],
+                    bank["gold_answer_ids"],
+                    alias_cache,
+                ),
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 "latency_seconds": 0.0,
             }
@@ -819,7 +824,10 @@ def main() -> None:
                         "parse_error": parse_error,
                         **e0.score_canonical_answer_set(predicted, bank["gold_answers"]),
                         **e0.score_alias_answer_set(
-                            predicted, bank["gold_answer_ids"], alias_cache
+                            predicted,
+                            bank["gold_answers"],
+                            bank["gold_answer_ids"],
+                            alias_cache,
                         ),
                         "usage": answer_usage,
                         "latency_seconds": answer_latency,
@@ -841,6 +849,7 @@ def main() -> None:
         write_jsonl(args.output_dir / "predictions.jsonl", results)
     report = {
         "status": "completed",
+        "metrics_schema_version": 2,
         "condition": "E3_grailqa_manual_llm_retrieval",
         "model": args.model,
         "questions": len(banks),
@@ -850,6 +859,7 @@ def main() -> None:
             bool(row["answer_attempted"]) for row in results
         ),
         "selection_only": args.selection_only,
+        "evaluation": e0.evaluation_metadata(alias_metadata),
         "configuration": {
             "noise_statements_per_question": args.noise_statements,
             "top_k": args.top_k,

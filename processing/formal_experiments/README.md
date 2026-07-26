@@ -205,3 +205,37 @@ processing/formal_experiments/output/runs/
 
 Do not reuse an E3 selection file across models. OpenAI and Ollama runs must
 remain in their separate output roots.
+
+## 5. Rebuild metric schema v2 without model calls
+
+Completed DeepInfra runs can be re-scored locally:
+
+```powershell
+& $py processing/formal_experiments/rebuild_formal_metrics_v2.py
+```
+
+This command makes zero API calls and does not overwrite `predictions.jsonl`
+or `metrics.json`. It writes:
+
+- `metrics_v2.json` for both datasets and every stage;
+- `predictions_v2.jsonl` for GrailQA, preserving the v1 scores inside each
+  row for audit;
+- `output/reports/deepinfra_qwen3_14b_v2/formal_audit_v2.json`.
+
+Metric schema v2 changes two reporting definitions:
+
+1. GrailQA alias-aware scoring groups Gold MIDs that share the same normalized
+   canonical answer string. A prediction matches a group when it matches any
+   accepted alias of a MID in that group. Single-token entity labels such as
+   `A`, `An`, and `The` are preserved during normalization.
+2. DeepInfra usage is reported as both `deepinfra_usage_incremental` (newly
+   billed calls in that stage) and `deepinfra_usage_condition_equivalent`
+   (the full compute represented by the condition). For E2, the latter
+   includes the E3 selector responses that were persisted and reused, while
+   the former excludes them. `deepinfra_usage` aliases the incremental view.
+
+Run the metric boundary tests with:
+
+```powershell
+& $py -m unittest processing/formal_experiments/test_formal_metrics_v2.py -v
+```

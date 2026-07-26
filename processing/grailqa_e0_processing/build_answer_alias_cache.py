@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import string
 import unicodedata
 from collections import Counter, defaultdict
@@ -54,8 +53,10 @@ def normalize_answer(value: str) -> str:
     value = unicodedata.normalize("NFKC", value).casefold().strip()
     value = value.replace("–", "-").replace("—", "-")
     value = "".join(" " if char in string.punctuation else char for char in value)
-    value = re.sub(r"\b(a|an|the)\b", " ", value)
-    return " ".join(value.split())
+    tokens = value.split()
+    if len(tokens) > 1:
+        tokens = [token for token in tokens if token not in {"a", "an", "the"}]
+    return " ".join(tokens)
 
 
 def target_answers(
@@ -261,8 +262,11 @@ def main() -> None:
         }
 
     payload: dict[str, Any] = {
-        "schema_version": 1,
-        "normalization": "NFKC + casefold + punctuation/articles removal + whitespace",
+        "schema_version": 2,
+        "normalization": (
+            "NFKC + casefold + punctuation removal + multi-token article removal "
+            "+ whitespace; preserve single-token A/An/The entity labels"
+        ),
         "target_questions": len(questions),
         "target_questions_by_hop": dict(sorted(by_hop.items())),
         "target_answer_mid_count": len(target_ids),
@@ -310,4 +314,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

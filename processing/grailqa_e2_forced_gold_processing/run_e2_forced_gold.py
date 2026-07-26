@@ -450,7 +450,10 @@ def main() -> None:
                 "parse_error": None,
                 **e3.e0.score_canonical_answer_set([], bank["gold_answers"]),
                 **e3.e0.score_alias_answer_set(
-                    [], bank["gold_answer_ids"], alias_cache
+                    [],
+                    bank["gold_answers"],
+                    bank["gold_answer_ids"],
+                    alias_cache,
                 ),
                 "usage": {
                     "prompt_tokens": 0,
@@ -483,7 +486,10 @@ def main() -> None:
                             predicted, bank["gold_answers"]
                         ),
                         **e3.e0.score_alias_answer_set(
-                            predicted, bank["gold_answer_ids"], alias_cache
+                            predicted,
+                            bank["gold_answers"],
+                            bank["gold_answer_ids"],
+                            alias_cache,
                         ),
                         "usage": answer_usage,
                         "latency_seconds": answer_latency,
@@ -509,6 +515,7 @@ def main() -> None:
         e3.write_jsonl(args.output_dir / "predictions.jsonl", results)
     report = {
         "status": "completed",
+        "metrics_schema_version": 2,
         "condition": validation["condition"],
         "model": args.model,
         "questions": len(banks),
@@ -521,6 +528,7 @@ def main() -> None:
         if args.selection_only
         else sum(bool(row["answer_attempted"]) for row in results),
         "selection_only": args.selection_only,
+        "evaluation": e3.e0.evaluation_metadata(alias_metadata),
         "configuration": {
             "noise_statements_per_question": args.noise_statements,
             "top_k": args.top_k,
