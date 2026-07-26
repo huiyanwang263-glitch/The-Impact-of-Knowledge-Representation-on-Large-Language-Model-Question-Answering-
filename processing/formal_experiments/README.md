@@ -1,7 +1,9 @@
 # Formal E0-E3 experiments
 
 This directory freezes and runs the formal KQA Pro and GrailQA experiments for
-Qwen (`qwen3-4b-16k`) and OpenAI (`gpt-5.4-2026-03-05`).
+local Qwen (`qwen3-4b-16k`), version-pinned DeepInfra Qwen
+(`Qwen/Qwen3-14B:01b0452aeedc42eaf4a73d87654a8129d6a436f0`) and OpenAI
+(`gpt-5.4-2026-03-05`).
 
 Formal sampling is fixed to:
 
@@ -123,6 +125,36 @@ GrailQA with Qwen:
   --dataset grailqa --backend ollama
 ```
 
+Qwen3-14B through DeepInfra:
+
+```powershell
+$env:DEEPINFRA_TOKEN = "your-token"
+
+& $py processing/formal_experiments/run_formal_experiment.py `
+  --dataset kqapro --backend deepinfra
+
+& $py processing/formal_experiments/run_formal_experiment.py `
+  --dataset grailqa --backend deepinfra
+```
+
+These commands only validate inputs and write a plan. The token is read from
+the environment and is never written to source code or experiment metadata.
+
+### DeepInfra smoke inputs
+
+Build a deterministic three-question manifest for each dataset, with one
+question from each hop:
+
+```powershell
+& $py processing/formal_experiments/build_deepinfra_smoke_inputs.py
+```
+
+Smoke artifacts and runs are isolated under:
+
+```text
+processing/formal_experiments/output/smoke/deepinfra/
+```
+
 ## 4. Execute
 
 After inspecting `run_plan.json`, repeat a command with `--execute`. The runner
@@ -147,6 +179,8 @@ processing/formal_experiments/output/runs/
   kqapro/ollama/qwen3-4b-16k/{e0,e1,e3,e2}
   grailqa/openai/gpt-5.4-2026-03-05/{e0,e1,e3,e2}
   grailqa/ollama/qwen3-4b-16k/{e0,e1,e3,e2}
+  kqapro/deepinfra/Qwen_Qwen3-14B_01b045.../{e0,e1,e3,e2}
+  grailqa/deepinfra/Qwen_Qwen3-14B_01b045.../{e0,e1,e3,e2}
 ```
 
 Do not reuse an E3 selection file across models. OpenAI and Ollama runs must

@@ -26,7 +26,9 @@ STAGE_ORDER = ("e0", "e1", "e3", "e2")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=("kqapro", "grailqa"), required=True)
-    parser.add_argument("--backend", choices=("openai", "ollama"), required=True)
+    parser.add_argument(
+        "--backend", choices=("openai", "ollama", "deepinfra"), required=True
+    )
     parser.add_argument("--model")
     parser.add_argument("--base-url")
     parser.add_argument(
@@ -189,11 +191,12 @@ def stage_commands(
     commands: list[dict[str, Any]] = []
     if args.dataset == "kqapro":
         manifest = input_dir / "oracle_questions.jsonl"
-        runner = (
-            HERE / "run_kqapro_openai.py"
-            if args.backend == "openai"
-            else HERE / "run_kqapro_ollama.py"
-        )
+        runners = {
+            "openai": HERE / "run_kqapro_openai.py",
+            "ollama": HERE / "run_kqapro_ollama.py",
+            "deepinfra": HERE / "run_kqapro_deepinfra.py",
+        }
+        runner = runners[args.backend]
         for stage in stages:
             command = [
                 sys.executable,
@@ -207,7 +210,7 @@ def stage_commands(
                 str(output_root),
             ]
             command += [
-                "--api-base" if args.backend == "openai" else "--base-url",
+                "--base-url" if args.backend == "ollama" else "--api-base",
                 base_url,
             ]
             commands.append({"stage": stage, "command": command})
@@ -240,11 +243,12 @@ def stage_commands(
     openai_runner = (
         PROCESSING / "openai_gpt54_experiments" / "run_grailqa_openai.py"
     )
+    deepinfra_runner = HERE / "run_grailqa_deepinfra.py"
     for stage in stages:
-        if args.backend == "openai":
+        if args.backend in {"openai", "deepinfra"}:
             command = [
                 sys.executable,
-                str(openai_runner),
+                str(openai_runner if args.backend == "openai" else deepinfra_runner),
                 stage,
                 "--model",
                 model,
@@ -297,14 +301,21 @@ def main() -> None:
     if len(stages) != len(set(stages)):
         raise ValueError("Duplicate stages requested")
     stages.sort(key=STAGE_ORDER.index)
-    model = args.model or (
-        "gpt-5.4-2026-03-05" if args.backend == "openai" else "qwen3-4b-16k"
-    )
-    base_url = args.base_url or (
-        "https://api.openai.com/v1"
-        if args.backend == "openai"
-        else "http://127.0.0.1:11434/v1"
-    )
+    default_models = {
+        "openai": "gpt-5.4-2026-03-05",
+        "ollama": "qwen3-4b-16k",
+        "deepinfra": (
+            "Qwen/Qwen3-14B:"
+            "01b0452aeedc42eaf4a73d87654a8129d6a436f0"
+        ),
+    }
+    default_base_urls = {
+        "openai": "https://api.openai.com/v1",
+        "ollama": "http://127.0.0.1:11434/v1",
+        "deepinfra": "https://api.deepinfra.com/v1/openai",
+    }
+    model = args.model or default_models[args.backend]
+    base_url = args.base_url or default_base_urls[args.backend]
     input_dir = args.input_dir or (
         INPUT_ROOT
         / ("kqapro_100_100_60" if args.dataset == "kqapro" else "grailqa_100_100_60")
@@ -357,9 +368,27 @@ def main() -> None:
         print("\nPlan only. Add --execute to start model calls.")
         return
 
-    for row in commands:
-        print(f"\n=== {row['stage'].upper()} ===", flush=True)
-        subprocess.run(row["command"], cwd=PROJECT, check=True, env=os.environ.copy())
+    plan["completed_stages"] = []
+    try:
+        for row in commands:
+            print(f"\n=== {row['stage'].upper()} ===", flush=True)
+            subprocess.run(
+                row["command"], cwd=PROJECT, check=True, env=os.environ.copy()
+            )
+            plan["completed_stages"].append(row["stage"])
+            plan_path.write_text(
+                json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+    except (OSError, subprocess.CalledProcessError) as error:
+        plan["status"] = "failed"
+        plan["failed_stage"] = row["stage"]
+        plan["error"] = str(error)
+        plan_path.write_text(
+            json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        raise
     plan["status"] = "completed"
     plan_path.write_text(
         json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
