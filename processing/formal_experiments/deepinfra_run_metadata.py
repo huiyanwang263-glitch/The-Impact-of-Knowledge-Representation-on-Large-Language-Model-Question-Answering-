@@ -25,18 +25,8 @@ def _usage_records(value: Any) -> Iterator[dict[str, Any]]:
             yield from _usage_records(nested)
 
 
-def aggregate_usage(output_dir: Path) -> dict[str, Any]:
-    """Deduplicate usage copied across checkpoints and final JSONL outputs."""
-    records: dict[str, dict[str, Any]] = {}
-    for path in sorted(output_dir.glob("*.jsonl")):
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                for usage in _usage_records(row):
-                    records.setdefault(str(usage["response_id"]), usage)
-
+def _summarize_usage(records: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Summarize response-ID-deduplicated provider usage."""
     prompt_tokens = sum(int(row.get("prompt_tokens", 0) or 0) for row in records.values())
     completion_tokens = sum(
         int(row.get("completion_tokens", 0) or 0) for row in records.values()
@@ -89,14 +79,55 @@ def aggregate_usage(output_dir: Path) -> dict[str, Any]:
     }
 
 
+def aggregate_usage_views(output_dir: Path) -> dict[str, dict[str, Any]]:
+    """Return condition-equivalent and newly billed usage for one stage.
+
+    E2 persists the selector usage copied from E3 to make the condition
+    self-contained. Those saved selector responses belong in the equivalent
+    cost of the condition, but not in the incremental bill of the E2 run.
+    """
+    condition_records: dict[str, dict[str, Any]] = {}
+    incremental_records: dict[str, dict[str, Any]] = {}
+    for path in sorted(output_dir.glob("*.jsonl")):
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                reused_selector = str(row.get("selector_source", "")).startswith(
+                    "saved_e3"
+                )
+                for key, value in row.items():
+                    for usage in _usage_records(value):
+                        response_id = str(usage["response_id"])
+                        condition_records.setdefault(response_id, usage)
+                        if reused_selector and key.startswith("selector_usage"):
+                            continue
+                        incremental_records.setdefault(response_id, usage)
+    return {
+        "condition_equivalent": _summarize_usage(condition_records),
+        "incremental_billed": _summarize_usage(incremental_records),
+    }
+
+
+def aggregate_usage(output_dir: Path) -> dict[str, Any]:
+    """Return newly billed usage; retained as the default public API."""
+    return aggregate_usage_views(output_dir)["incremental_billed"]
+
+
 def annotate_output(output_dir: Path, model: str, api_base: str) -> None:
     requested_name, separator, requested_version = model.partition(":")
-    usage = aggregate_usage(output_dir)
+    usage_views = aggregate_usage_views(output_dir)
+    incremental_usage = usage_views["incremental_billed"]
+    condition_usage = usage_views["condition_equivalent"]
     expected_served_model = requested_name
-    served_model_consistent = usage["served_models"] in ([], [expected_served_model])
+    served_model_consistent = condition_usage["served_models"] in (
+        [],
+        [expected_served_model],
+    )
     thinking_disabled_verified = (
-        usage["reasoning_tokens"] == 0
-        and not usage["reasoning_content_present"]
+        condition_usage["reasoning_tokens"] == 0
+        and not condition_usage["reasoning_content_present"]
     )
     provider = {
         "provider": "deepinfra",
@@ -119,7 +150,17 @@ def annotate_output(output_dir: Path, model: str, api_base: str) -> None:
             continue
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["deepinfra_provider"] = provider
-        payload["deepinfra_usage"] = usage
+        payload["deepinfra_usage"] = incremental_usage
+        payload["deepinfra_usage_incremental"] = incremental_usage
+        payload["deepinfra_usage_condition_equivalent"] = condition_usage
+        payload["deepinfra_usage_accounting"] = {
+            "schema_version": 2,
+            "deepinfra_usage_alias": "incremental_billed",
+            "incremental_billed_excludes_saved_e3_selector_usage": True,
+            "condition_equivalent_includes_saved_e3_selector_usage": True,
+        }
+        if filename == "metrics.json":
+            payload["metrics_schema_version"] = 2
         configuration = payload.get("configuration")
         if filename == "configuration.json" and not isinstance(configuration, dict):
             configuration = payload
