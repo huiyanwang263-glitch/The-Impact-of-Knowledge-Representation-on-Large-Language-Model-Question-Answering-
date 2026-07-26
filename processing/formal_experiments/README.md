@@ -171,6 +171,26 @@ Example:
   --dataset kqapro --backend openai --execute
 ```
 
+For the complete DeepInfra formal run, use the checked launcher. It validates
+the token and runs KQA Pro before GrailQA, stopping immediately if either
+dataset fails:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File processing/formal_experiments/run_deepinfra_formal.ps1
+```
+
+Run its non-billable validation path first when needed:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File processing/formal_experiments/run_deepinfra_formal.ps1 -PlanOnly
+```
+
+To execute or validate only one dataset, add `-Dataset kqapro` or
+`-Dataset grailqa`. The launcher reads `DEEPINFRA_TOKEN` from the current
+process or the persistent user environment and never prints it.
+
 Default outputs:
 
 ```text
